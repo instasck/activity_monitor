@@ -1,0 +1,5 @@
+pynput
+requests
+singleton
+tendo
+messagebox
