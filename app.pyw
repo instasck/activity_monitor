@@ -3,6 +3,8 @@ import sched, time
 import requests
 import sys
 import socket
+import pystray
+from PIL import Image, ImageDraw
 from PIL import ImageGrab
 from threading import Thread
 from pynput.keyboard import Listener as KeyboardListener
@@ -14,6 +16,8 @@ from datetime import datetime, timedelta
 from requests.packages.urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 import subprocess
+import cv2
+import numpy as np
 
 # # locker
 lock_filename = 'running.lock'
@@ -38,14 +42,82 @@ INACTIVE_TIME_SEC = 60
 REFRESH_TRY_TIME_SEC = 2
 MIN_CLOUD_UPDATE_TIME_SEC = 10
 
+# Activity tracking
+keyboard_counter = 0
+mouse_counter = 0
+
+class VideoRecorder:
+    def __init__(self, pc_name):
+        root_drive = os.path.splitdrive(os.getcwd())[0] + os.sep
+        self.base_dir = os.path.join(root_drive, "activity", pc_name)
+        self.save_dir = os.path.join(self.base_dir, "videos")
+        if not os.path.exists(self.save_dir):
+            os.makedirs(self.save_dir)
+        self.recording = False
+        self.duration = 30
+        self.break_time = 15
+        self.fps = 5.0
+        self.fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        self.cleanup_days = 7
+
+    def delete_old_videos(self):
+        now = datetime.now()
+        if not os.path.exists(self.save_dir):
+            return
+        for filename in os.listdir(self.save_dir):
+            file_path = os.path.join(self.save_dir, filename)
+            if os.path.isfile(file_path) and filename.endswith(".avi"):
+                file_modified_time = datetime.fromtimestamp(os.path.getmtime(file_path))
+                if now - file_modified_time > timedelta(days=self.cleanup_days):
+                    try:
+                        os.remove(file_path)
+                        print(f"Deleted old video: {filename}")
+                    except:
+                        pass
+
+    def start_recording_loop(self):
+        while True:
+            self.record_segment()
+            time.sleep(self.break_time)
+
+    def record_segment(self):
+        current_time_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename = os.path.join(self.save_dir, f"video_{current_time_str}.avi")
+        
+        # Low quality: smaller resolution
+        try:
+            screen_size = ImageGrab.grab().size
+        except:
+            return # Probably locked or no screen
+            
+        low_res = (screen_size[0] // 2, screen_size[1] // 2)
+        
+        out = cv2.VideoWriter(filename, self.fourcc, self.fps, low_res)
+        
+        start_time = time.time()
+        print(f"Recording video segment: {filename}")
+        while (time.time() - start_time) < self.duration:
+            img = ImageGrab.grab()
+            img_np = np.array(img)
+            frame = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+            frame_small = cv2.resize(frame, low_res)
+            out.write(frame_small)
+            # Sleep to match FPS roughly
+            time.sleep(1/self.fps)
+        
+        out.release()
+        print(f"Finished recording: {filename}")
+
 ip_address = 'https://www.dash.instasck.com'
 wait_newuser_tt = os.path.join(os.path.dirname(os.getcwd()), 'updater', 'wait_newuser_tt')
 wait_newuser_ig = os.path.join(os.path.dirname(os.getcwd()), 'updater', 'wait_newuser_ig')
 
 class ScreenShotsInterval:
 
-    def __init__(self):
-        self.save_ss_dir = "shots"
+    def __init__(self, pc_name):
+        root_drive = os.path.splitdrive(os.getcwd())[0] + os.sep
+        self.base_dir = os.path.join(root_drive, "activity", pc_name)
+        self.save_ss_dir = os.path.join(self.base_dir, "shots")
         if not os.path.exists(self.save_ss_dir):
             os.makedirs(self.save_ss_dir)
         # Variable to store the time of the last screenshot
@@ -55,22 +127,36 @@ class ScreenShotsInterval:
         self.screenshot_interval = timedelta(minutes=5)
     
     def delete_old_screenshots(self):
-        """Delete screenshots older than 30 days."""
+        """Delete screenshots and videos older than 7 days."""
         now = datetime.now()
-        days_threshold = 30
+        days_threshold = 7
 
-        for filename in os.listdir(self.save_ss_dir):
-            file_path = os.path.join(self.save_ss_dir, filename)
-            # Check if it's a file and ends with .png (assuming screenshots are in PNG format)
-            if os.path.isfile(file_path) and filename.endswith(".png"):
-                # Get the file's last modification time
-                file_modified_time = datetime.fromtimestamp(os.path.getmtime(file_path))
-                # Calculate the age of the file
-                file_age = now - file_modified_time
-                # If the file is older than the threshold, delete it
-                if file_age > timedelta(days=days_threshold):
-                    os.remove(file_path)
-                    print(f"Deleted old screenshot: {filename}")
+        # Cleanup screenshots
+        if os.path.exists(self.save_ss_dir):
+            for filename in os.listdir(self.save_ss_dir):
+                file_path = os.path.join(self.save_ss_dir, filename)
+                if os.path.isfile(file_path) and filename.endswith(".png"):
+                    file_modified_time = datetime.fromtimestamp(os.path.getmtime(file_path))
+                    if now - file_modified_time > timedelta(days=days_threshold):
+                        try:
+                            os.remove(file_path)
+                            print(f"Deleted old screenshot: {filename}")
+                        except:
+                            pass
+        
+        # Cleanup videos
+        video_dir = os.path.join(self.base_dir, "videos")
+        if os.path.exists(video_dir):
+            for filename in os.listdir(video_dir):
+                file_path = os.path.join(video_dir, filename)
+                if os.path.isfile(file_path) and filename.endswith(".avi"):
+                    file_modified_time = datetime.fromtimestamp(os.path.getmtime(file_path))
+                    if now - file_modified_time > timedelta(days=days_threshold):
+                        try:
+                            os.remove(file_path)
+                            print(f"Deleted old video: {filename}")
+                        except:
+                            pass
 
     def take_screenshot(self,):
         current_time = datetime.now()
@@ -104,23 +190,25 @@ class UserActivity:
         self.sched_obj: sched.scheduler = None
         self.sched_obj_id = None
         self.listener = None
-        self.my_screenshot = ScreenShotsInterval()
+        self.my_screenshot = ScreenShotsInterval(pc_name)
 
     @classmethod
     def on_press(self, key):
         """
         GET KEYBOARD PRESSED KEYS
         """
-        global last_key, last_x, last_y, file_name
+        global last_key, last_x, last_y, file_name, keyboard_counter
         last_key = str(key)
+        keyboard_counter += 1
 
     @classmethod
     def on_move(self, x, y):
         """
         GET MOVEMENT OF MOUSE
         """
-        global last_key, last_x, last_y, file_name
+        global last_key, last_x, last_y, file_name, mouse_counter
         last_x, last_y = x, y
+        mouse_counter += 1
 
     @classmethod
     def on_click(self, x, y, button, pressed):
@@ -128,16 +216,18 @@ class UserActivity:
         GET CLICK MOVEMENT MOUSE
         """
         if pressed:
-            global last_key, last_x, last_y, file_name
+            global last_key, last_x, last_y, file_name, mouse_counter
             last_x, last_y = x+1 , y
+            mouse_counter += 5
 
     @classmethod
     def on_scroll(self, x, y, dx, dy):
         """
         GET MOVEMENT SCROLL
         """
-        global last_key, last_x, last_y, file_name, ip_address
+        global last_key, last_x, last_y, file_name, ip_address, mouse_counter
         last_x, last_y = x+1, y+1
+        mouse_counter += 2
     
     def get_pc_name(self,):
         pc_name = self.pc_name_ext
@@ -154,15 +244,25 @@ class UserActivity:
         return pc_name
 
     def __send_last_seen_to_web(self, val, time=None):
+        global keyboard_counter, mouse_counter
         print(f'{datetime.now().strftime("%H:%M:%S")} ~ Set Status - {val} - to Cloud')
+        
+        # Calculate activity score
+        raw_score = (keyboard_counter * 2) + mouse_counter
+        # Normalize to 0-100. Max score around 300 for 10 seconds of high activity.
+        activity_score = min(100, int((raw_score / 300) * 100))
+        
         url = f"{ip_address}/api/pc-module"
         data = {
             "pc_name": self.get_pc_name(),
             "status": val,
             "time": time,
-            "list_of_phone": f'IG: {instagram_version_date()}, TT: {tiktok_version_date()}',
-            # "list_of_phone": f'IG: 5, TT: 6',
+            "list_of_phone": f'Activity: {activity_score}',
         }
+
+        # Reset counters
+        keyboard_counter = 0
+        mouse_counter = 0
         s = requests.Session()
 
         retries = Retry(total=50,
@@ -255,46 +355,152 @@ def get_hostname_pc():
 
 class TkApp(tk.Tk):
     def __init__(self):
-        tk.Tk.__init__(self)
+        super().__init__()
+
+        self.tray_icon = None
+        self.tray_thread = None
+        self.is_hidden = False
+
         toolbar = tk.Frame(self)
         toolbar.pack(side="top", fill="x")
-        # set window size
+
         self.geometry("500x200")
         self.title("Activity Monitor")
+
         self.text = tk.Text(self, wrap="word")
         self.text.pack(side="top", fill="both", expand=True)
         self.text.tag_configure("stderr", foreground="#b22222")
         self.text.yview("end")
-        self.iconbitmap("activity.ico")
+
+        try:
+            self.iconbitmap("activity.ico")
+        except Exception:
+            pass
+
         sys.stdout = TextRedirector(self.text, "stdout")
         sys.stderr = TextRedirector(self.text, "stderr")
 
-        self.protocol('WM_DELETE_WINDOW', self.on_close)
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.create_tray_icon()
+        self.withdraw()   # לא יופיע בהתחלה
+        self.is_hidden = True
 
         self.run()
 
+    def create_image(self):
+        # אם יש לך PNG עדיף:
+        # return Image.open("activity.png")
+
+        try:
+            return Image.open("activity.ico")
+        except Exception:
+            image = Image.new("RGB", (64, 64), (40, 40, 40))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((16, 16, 48, 48), fill=(0, 200, 0))
+            return image
+
+    def create_tray_icon(self):
+        image = self.create_image()
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Show", self.show_window),
+            pystray.MenuItem("Exit", self.exit_app)
+        )
+
+        self.tray_icon = pystray.Icon(
+            "activity_monitor",
+            image,
+            "Activity Monitor",
+            menu
+        )
+
+        self.tray_thread = Thread(target=self.tray_icon.run, daemon=True)
+        self.tray_thread.start()
+
+    def show_window(self, icon=None, item=None):
+        self.after(0, self._show_window)
+
+    def _show_window(self):
+        self.deiconify()
+        self.is_hidden = False
+        self.lift()
+        self.focus_force()
+
+    def hide_window(self):
+        self.withdraw()
+        self.is_hidden = True
+
     def on_close(self):
+        # במקום לסגור - למזער ל-tray
+        self.hide_window()
+
+    def exit_app(self, icon=None, item=None):
         response = tkinter.messagebox.askyesno('Exit', 'Are you sure you want to exit?')
         if response:
             try:
                 print('closing the scheduler')
                 self.activity_obj.close()
+            except Exception:
+                pass
+
+            try:
                 print('closing the listener')
-                self.activity_obj.listener.stop()
+                if getattr(self.activity_obj, 'listener', None):
+                    self.activity_obj.listener.stop()
+            except Exception:
+                pass
+
+            try:
+                if self.tray_icon:
+                    self.tray_icon.stop()
+            except Exception:
+                pass
+
+            try:
                 print('destroying the tk')
                 self.quit()
+                self.destroy()
             finally:
                 sys.exit(0)
 
     def run(self):
         pc_name = get_input_pc_name()
         if pc_name == '':
-            pc_name = get_hostname_pc()
+            import getpass
+            username = getpass.getuser()
+            hostname = get_hostname_pc()
+            pc_name = f"{username}_{hostname}"
 
         print(f'pc_name {pc_name}')
         self.activity_obj = UserActivity(pc_name)
-        Thread(target=self.activity_obj._check_activity).start()
-        Thread(target=self.activity_obj._check_timeactivity).start()
+        self.video_recorder = VideoRecorder(pc_name)
+        
+        Thread(target=self.activity_obj._check_activity, daemon=True).start()
+        Thread(target=self.activity_obj._check_timeactivity, daemon=True).start()
+        Thread(target=self.video_recorder.start_recording_loop, daemon=True).start()
+        
+        # Auto-restart every 5 hours
+        restart_interval_sec = 5 * 60 * 60
+        Thread(target=self.schedule_restart, args=(restart_interval_sec,), daemon=True).start()
+
+    def schedule_restart(self, delay):
+        print(f"App will restart in {delay/3600} hours...")
+        time.sleep(delay)
+        self.restart_now()
+
+    def restart_now(self):
+        print("Restarting application...")
+        try:
+            # Clean up before restart
+            if self.tray_icon:
+                self.tray_icon.stop()
+        except:
+            pass
+            
+        # os.execv replaces the current process
+        python = sys.executable
+        os.execv(python, [python] + sys.argv)
 
 
 def get_commit_day(repo_path):

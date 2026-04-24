@@ -2,4 +2,8 @@ pynput
 requests
 singleton
 tendo
-messagebox
+pystray
+pillow
+opencv-python
+numpy
+pywin32
