@@ -19,13 +19,6 @@ import subprocess
 import cv2
 import numpy as np
 
-# # locker
-lock_filename = 'running.lock'
-if os.path.exists(lock_filename):
-    os.remove(lock_filename)
-me = singleton.SingleInstance(lockfile=lock_filename)  # will sys.exit(-1) if other instance is running
-
-
 last_key = ""
 last_x = ""
 last_y = ""
