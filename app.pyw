@@ -19,12 +19,30 @@ import subprocess
 import cv2
 import numpy as np
 
+# # locker
+import getpass
+
+username = getpass.getuser()
+
+lock_filename = f'running_{username}.lock'
+
+if os.path.exists(lock_filename):
+    os.remove(lock_filename)
+
+me = singleton.SingleInstance(lockfile=lock_filename)
+
+
 last_key = ""
 last_x = ""
 last_y = ""
 file_name = "data.json"
 
-new_key, new_x, new_y = "","",""
+# Activity tracking
+keyboard_counter = 0
+mouse_counter = 0
+activity_events = []
+
+new_key, new_x, new_y = "", "", ""
 last_update_time = datetime.now()
 last_update_time_prev = datetime.min
 update_active = False
@@ -35,36 +53,38 @@ INACTIVE_TIME_SEC = 60
 REFRESH_TRY_TIME_SEC = 2
 MIN_CLOUD_UPDATE_TIME_SEC = 10
 
-# Activity tracking
-keyboard_counter = 0
-mouse_counter = 0
+ip_address = 'https://www.dash.instasck.com'
+wait_newuser_tt = os.path.join(os.path.dirname(os.getcwd()), 'updater', 'wait_newuser_tt')
+wait_newuser_ig = os.path.join(os.path.dirname(os.getcwd()), 'updater', 'wait_newuser_ig')
+
 
 class VideoRecorder:
     def __init__(self, pc_name):
         root_drive = os.path.splitdrive(os.getcwd())[0] + os.sep
         self.base_dir = os.path.join(root_drive, "activity", pc_name)
-        self.save_dir = os.path.join(self.base_dir, "videos")
+        self.save_dir = os.path.join(self.base_dir, "shots")
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
         self.recording = False
-        self.duration = 30
-        self.break_time = 15
-        self.fps = 5.0
-        self.fourcc = cv2.VideoWriter_fourcc(*'XVID')
-        self.cleanup_days = 7
+        self.duration = 15
+        self.break_time = 45
+        self.fps = 8.0
+        self.fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+        self.cleanup_hours = 48
 
-    def delete_old_videos(self):
+    def delete_old_files(self):
+        """Delete videos and screenshots older than 48 hours."""
         now = datetime.now()
         if not os.path.exists(self.save_dir):
             return
         for filename in os.listdir(self.save_dir):
             file_path = os.path.join(self.save_dir, filename)
-            if os.path.isfile(file_path) and filename.endswith(".avi"):
+            if os.path.isfile(file_path) and (filename.endswith(".avi") or filename.endswith(".png") or filename.endswith(".jpg")):
                 file_modified_time = datetime.fromtimestamp(os.path.getmtime(file_path))
-                if now - file_modified_time > timedelta(days=self.cleanup_days):
+                if now - file_modified_time > timedelta(hours=self.cleanup_hours):
                     try:
                         os.remove(file_path)
-                        print(f"Deleted old video: {filename}")
+                        print(f"Deleted old file: {filename}")
                     except:
                         pass
 
@@ -74,100 +94,110 @@ class VideoRecorder:
             time.sleep(self.break_time)
 
     def record_segment(self):
-        current_time_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        current_time = datetime.now()
+        global activity_events
+        # Check if there was any activity in the last minute
+        activity_in_interval = any(t > current_time - timedelta(minutes=1) for t in activity_events)
+        
+        # Cleanup old activity events
+        cutoff = current_time - timedelta(minutes=5)
+        activity_events = [t for t in activity_events if t > cutoff]
+
+        if not activity_in_interval:
+            print("No activity in last minute, skipping video recording.")
+            return
+
+        self.delete_old_files()
+        current_time_str = current_time.strftime("%Y-%m-%d_%H-%M-%S")
         filename = os.path.join(self.save_dir, f"video_{current_time_str}.avi")
         
-        # Low quality: smaller resolution
         try:
-            screen_size = ImageGrab.grab().size
-        except:
+            # Test ImageGrab to ensure it works
+            img_test = ImageGrab.grab()
+            screen_size = img_test.size
+        except Exception as e:
+            print(f"Failed to grab screen for video size: {e}")
             return # Probably locked or no screen
             
-        low_res = (screen_size[0] // 2, screen_size[1] // 2)
+        full_res = (screen_size[0] // 2 * 2, screen_size[1] // 2 * 2)
         
-        out = cv2.VideoWriter(filename, self.fourcc, self.fps, low_res)
-        
-        start_time = time.time()
-        print(f"Recording video segment: {filename}")
-        while (time.time() - start_time) < self.duration:
-            img = ImageGrab.grab()
-            img_np = np.array(img)
-            frame = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-            frame_small = cv2.resize(frame, low_res)
-            out.write(frame_small)
-            # Sleep to match FPS roughly
-            time.sleep(1/self.fps)
-        
-        out.release()
-        print(f"Finished recording: {filename}")
+        try:
+            # MJPG is more compatible in headless environments
+            out = cv2.VideoWriter(filename, self.fourcc, self.fps, full_res)
+            
+            if not out.isOpened():
+                print(f"Failed to open VideoWriter with {filename}")
+                return
 
-ip_address = 'https://www.dash.instasck.com'
-wait_newuser_tt = os.path.join(os.path.dirname(os.getcwd()), 'updater', 'wait_newuser_tt')
-wait_newuser_ig = os.path.join(os.path.dirname(os.getcwd()), 'updater', 'wait_newuser_ig')
+            start_time = time.time()
+            print(f"Recording video segment: {filename}")
+            frames_recorded = 0
+            while (time.time() - start_time) < self.duration:
+                try:
+                    img = ImageGrab.grab()
+                    img_np = np.array(img)
+                    frame = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+                    frame_final = cv2.resize(frame, full_res)
+                    out.write(frame_final)
+                    frames_recorded += 1
+                except Exception as e:
+                    print(f"Error capturing frame: {e}")
+                time.sleep(1/self.fps)
+            
+            out.release()
+            print(f"Finished recording: {filename}. Frames recorded: {frames_recorded}")
+        except Exception as e:
+            print(f"Failed to record video: {e}")
+
 
 class ScreenShotsInterval:
 
     def __init__(self, pc_name):
+        self.last_screenshot_time = None
         root_drive = os.path.splitdrive(os.getcwd())[0] + os.sep
         self.base_dir = os.path.join(root_drive, "activity", pc_name)
         self.save_ss_dir = os.path.join(self.base_dir, "shots")
         if not os.path.exists(self.save_ss_dir):
             os.makedirs(self.save_ss_dir)
-        # Variable to store the time of the last screenshot
-        self.last_screenshot_time = None
 
-        # Set the interval for screenshots (1 hour)
-        self.screenshot_interval = timedelta(minutes=5)
-    
-    def delete_old_screenshots(self):
-        """Delete screenshots and videos older than 7 days."""
-        now = datetime.now()
-        days_threshold = 7
+        # Set the interval for screenshots (10 seconds)
+        self.screenshot_interval = timedelta(seconds=10)
 
-        # Cleanup screenshots
-        if os.path.exists(self.save_ss_dir):
-            for filename in os.listdir(self.save_ss_dir):
-                file_path = os.path.join(self.save_ss_dir, filename)
-                if os.path.isfile(file_path) and filename.endswith(".png"):
-                    file_modified_time = datetime.fromtimestamp(os.path.getmtime(file_path))
-                    if now - file_modified_time > timedelta(days=days_threshold):
-                        try:
-                            os.remove(file_path)
-                            print(f"Deleted old screenshot: {filename}")
-                        except:
-                            pass
-        
-        # Cleanup videos
-        video_dir = os.path.join(self.base_dir, "videos")
-        if os.path.exists(video_dir):
-            for filename in os.listdir(video_dir):
-                file_path = os.path.join(video_dir, filename)
-                if os.path.isfile(file_path) and filename.endswith(".avi"):
-                    file_modified_time = datetime.fromtimestamp(os.path.getmtime(file_path))
-                    if now - file_modified_time > timedelta(days=days_threshold):
-                        try:
-                            os.remove(file_path)
-                            print(f"Deleted old video: {filename}")
-                        except:
-                            pass
-
-    def take_screenshot(self,):
+    def take_screenshot(self, ):
         current_time = datetime.now()
         # If no screenshot has been taken yet, or the interval has passed since the last screenshot
         if self.last_screenshot_time is None or current_time - self.last_screenshot_time >= self.screenshot_interval:
-            # Call the method to delete old screenshots
-            self.delete_old_screenshots()
+            # Check for activity in the last interval
+            global activity_events
+            activity_in_interval = any(t > current_time - self.screenshot_interval for t in activity_events)
+            if not activity_in_interval:
+                return
+
+            # Call the method to delete old files (done by VideoRecorder loop too, but here for safety)
+            # Actually, VideoRecorder handles deletion for this folder now, so we can just focus on taking screenshot
+            
             # Get the current time and format it
-            current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             try:
                 screenshot = ImageGrab.grab()
-                
-                # Save screenshot
-                screenshot.save(os.path.join(self.save_ss_dir, f"screenshot_{current_time}.png"))
+
+                # Standard quality: full resolution (ensuring even dimensions)
+                width, height = screenshot.size
+                full_res = (width // 2 * 2, height // 2 * 2)
+                screenshot = screenshot.resize(full_res, Image.LANCZOS)
+
+                # Convert to RGB if necessary for JPEG
+                if screenshot.mode in ("RGBA", "P"):
+                    screenshot = screenshot.convert("RGB")
+
+                # Save screenshot as JPG with improved quality
+                save_path = os.path.join(self.save_ss_dir, f"screenshot_{timestamp}.jpg")
+                screenshot.save(save_path, "JPEG", quality=80)
+
                 self.last_screenshot_time = datetime.now()
-                print(f"Screenshot saved as screenshot_{current_time}.png")
-            except:
-                print('Failed taking screenshot')
+                print(f"Screenshot saved as screenshot_{timestamp}.jpg (standard quality)")
+            except Exception as e:
+                print(f'Failed taking screenshot: {e}')
 
 
 class ActivityStatus:
@@ -190,18 +220,20 @@ class UserActivity:
         """
         GET KEYBOARD PRESSED KEYS
         """
-        global last_key, last_x, last_y, file_name, keyboard_counter
+        global last_key, last_x, last_y, file_name, keyboard_counter, activity_events
         last_key = str(key)
         keyboard_counter += 1
+        activity_events.append(datetime.now())
 
     @classmethod
     def on_move(self, x, y):
         """
         GET MOVEMENT OF MOUSE
         """
-        global last_key, last_x, last_y, file_name, mouse_counter
+        global last_key, last_x, last_y, file_name, mouse_counter, activity_events
         last_x, last_y = x, y
         mouse_counter += 1
+        activity_events.append(datetime.now())
 
     @classmethod
     def on_click(self, x, y, button, pressed):
@@ -209,20 +241,22 @@ class UserActivity:
         GET CLICK MOVEMENT MOUSE
         """
         if pressed:
-            global last_key, last_x, last_y, file_name, mouse_counter
-            last_x, last_y = x+1 , y
+            global last_key, last_x, last_y, file_name, mouse_counter, activity_events
+            last_x, last_y = x + 1, y
             mouse_counter += 5
+            activity_events.append(datetime.now())
 
     @classmethod
     def on_scroll(self, x, y, dx, dy):
         """
         GET MOVEMENT SCROLL
         """
-        global last_key, last_x, last_y, file_name, ip_address, mouse_counter
-        last_x, last_y = x+1, y+1
+        global last_key, last_x, last_y, file_name, ip_address, mouse_counter, activity_events
+        last_x, last_y = x + 1, y + 1
         mouse_counter += 2
-    
-    def get_pc_name(self,):
+        activity_events.append(datetime.now())
+
+    def get_pc_name(self, ):
         pc_name = self.pc_name_ext
         if pc_name is None:
             try:
@@ -233,17 +267,58 @@ class UserActivity:
                 pc_name = os.environ['USER']
             except:
                 pass
-        
+
         return pc_name
 
     def __send_last_seen_to_web(self, val, time=None):
-        global keyboard_counter, mouse_counter
+        global keyboard_counter, mouse_counter, activity_events
         print(f'{datetime.now().strftime("%H:%M:%S")} ~ Set Status - {val} - to Cloud')
         
-        # Calculate activity score
-        raw_score = (keyboard_counter * 2) + mouse_counter
-        # Normalize to 0-100. Max score around 300 for 10 seconds of high activity.
-        activity_score = min(100, int((raw_score / 300) * 100))
+        # Calculate activity score based on the last 5 minutes
+        now = datetime.now()
+        five_minutes_ago = now - timedelta(minutes=5)
+        # Keep events that could contribute to the last 5 minutes (up to 10s before the window)
+        activity_threshold = five_minutes_ago - timedelta(seconds=10)
+        
+        # Filter events
+        activity_events = [t for t in activity_events if t > activity_threshold]
+        
+        active_duration_seconds = 0
+        if activity_events:
+            # Sort events by timestamp
+            sorted_events = sorted(activity_events)
+            
+            # Merge intervals of 10 seconds for each event
+            # Each event at time 't' makes the user active for [t, t + 10s]
+            merged_intervals = []
+            if sorted_events:
+                current_start = sorted_events[0]
+                current_end = current_start + timedelta(seconds=10)
+                
+                for i in range(1, len(sorted_events)):
+                    next_event = sorted_events[i]
+                    if next_event <= current_end:
+                        # Overlapping or adjacent, extend the current interval
+                        current_end = max(current_end, next_event + timedelta(seconds=10))
+                    else:
+                        # No overlap, save current and start new
+                        merged_intervals.append((current_start, current_end))
+                        current_start = next_event
+                        current_end = next_event + timedelta(seconds=10)
+                merged_intervals.append((current_start, current_end))
+            
+            # Sum up durations, clipping to the 5-minute window
+            total_active_timedelta = timedelta(0)
+            for start, end in merged_intervals:
+                actual_start = max(start, five_minutes_ago)
+                actual_end = min(end, now)
+                if actual_end > actual_start:
+                    total_active_timedelta += (actual_end - actual_start)
+            
+            active_duration_seconds = total_active_timedelta.total_seconds()
+        
+        # Activity score is the percentage of active time in the 5-minute window (300 seconds)
+        activity_score = min(100, int((active_duration_seconds / 300) * 100))
         
         url = f"{ip_address}/api/pc-module"
         data = {
@@ -252,7 +327,7 @@ class UserActivity:
             "time": time,
             "list_of_phone": f'Activity: {activity_score}',
         }
-
+        
         # Reset counters
         keyboard_counter = 0
         mouse_counter = 0
@@ -260,29 +335,30 @@ class UserActivity:
 
         retries = Retry(total=50,
                         backoff_factor=0.1,
-                        status_forcelist=[ 500, 502, 503, 504 ])
-                        #allowed_methods=frozenset(['GET', 'POST']))
+                        status_forcelist=[500, 502, 503, 504])
+        # allowed_methods=frozenset(['GET', 'POST']))
 
         s.mount('http://', HTTPAdapter(max_retries=retries))
         try:
             response = s.post(url, data=data, timeout=10)
             if response.status_code == 200:
-                pass  
+                pass
             else:
-                print("__error__",response.__dict__)
+                print("__error__", response.__dict__)
         except:
             print('POST error')
-            
+
         self.my_screenshot.take_screenshot()
 
     def _check_timeactivity(self):
-        
+
         self.sched_obj = sched.scheduler(time.time, time.sleep)
         self.sched_obj_id = self.sched_obj.enter(REFRESH_TRY_TIME_SEC, 1, self.__time_schedular, (self.sched_obj,))
         self.sched_obj.run()
 
     def _check_activity(self):
-        with MouseListener(on_click=UserActivity.on_click, on_move=UserActivity.on_move,on_scroll=UserActivity.on_scroll) as self.listener:
+        with MouseListener(on_click=UserActivity.on_click, on_move=UserActivity.on_move,
+                           on_scroll=UserActivity.on_scroll) as self.listener:
             with KeyboardListener(on_press=UserActivity.on_press) as self.listener:
                 print("""Welcome\nRunning......................\n""")
                 self.listener.join()
@@ -297,7 +373,7 @@ class UserActivity:
 
             if not update_active or \
                     datetime.now() > last_update_time_prev + timedelta(seconds=MIN_CLOUD_UPDATE_TIME_SEC):
-                last_update_time_prev = last_update_time
+                last_update_time_prev = datetime.now()
                 print(f'Last key press: {new_key} last mouse cord: ({new_x}, {new_y})')
                 self.__send_last_seen_to_web(ActivityStatus.ACTIVE)
                 update_active = True
@@ -311,21 +387,25 @@ class UserActivity:
             current_time = datetime.now()
             if current_time > away_time:
                 if current_time > inactive_time:
-                    if not inactive_status:
+                    if not inactive_status or \
+                            datetime.now() > last_update_time_prev + timedelta(seconds=60):
                         self.__send_last_seen_to_web(ActivityStatus.INACTIVE, last_update_time)
                         offline_status = False
                         update_active = False
                         inactive_status = True
-                elif not offline_status:
+                        last_update_time_prev = datetime.now()
+                elif not offline_status or \
+                        datetime.now() > last_update_time_prev + timedelta(seconds=60):
                     self.__send_last_seen_to_web(ActivityStatus.AWAY, last_update_time)
                     offline_status = True
                     update_active = False
                     inactive_status = False
+                    last_update_time_prev = datetime.now()
                 else:
                     pass
-        
+
         self.sched_obj_id = sc.enter(REFRESH_TRY_TIME_SEC, 1, self.__time_schedular, (sc,))
-        
+
     def close(self):
         self.sched_obj.cancel(self.sched_obj_id)
 
@@ -376,7 +456,7 @@ class TkApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.create_tray_icon()
-        self.withdraw()   # לא יופיע בהתחלה
+        self.withdraw()  # לא יופיע בהתחלה
         self.is_hidden = True
 
         self.run()
@@ -463,16 +543,16 @@ class TkApp(tk.Tk):
             import getpass
             username = getpass.getuser()
             hostname = get_hostname_pc()
-            pc_name = f"{username}_{hostname}"
+            pc_name = f"USER_{hostname}_{username}"
 
         print(f'pc_name {pc_name}')
         self.activity_obj = UserActivity(pc_name)
         self.video_recorder = VideoRecorder(pc_name)
-        
+
         Thread(target=self.activity_obj._check_activity, daemon=True).start()
         Thread(target=self.activity_obj._check_timeactivity, daemon=True).start()
         Thread(target=self.video_recorder.start_recording_loop, daemon=True).start()
-        
+
         # Auto-restart every 5 hours
         restart_interval_sec = 5 * 60 * 60
         Thread(target=self.schedule_restart, args=(restart_interval_sec,), daemon=True).start()
@@ -480,7 +560,7 @@ class TkApp(tk.Tk):
     def schedule_restart(self, delay):
         print(f"App will restart in {delay/3600} hours...")
         time.sleep(delay)
-        self.restart_now()
+        #self.restart_now()
 
     def restart_now(self):
         print("Restarting application...")
@@ -490,7 +570,7 @@ class TkApp(tk.Tk):
                 self.tray_icon.stop()
         except:
             pass
-            
+
         # os.execv replaces the current process
         python = sys.executable
         os.execv(python, [python] + sys.argv)
@@ -510,14 +590,14 @@ def get_commit_day(repo_path):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        startupinfo = startupinfo,  #This suppresses the terminal window
-        creationflags = subprocess.CREATE_NO_WINDOW  #Important for .pyw
+        startupinfo=startupinfo,  # This suppresses the terminal window
+        creationflags=subprocess.CREATE_NO_WINDOW  # Important for .pyw
     )
 
     if result.returncode == 0:
         # Extract just the day eg -25 from 2025-04-25 hh:mm:ss
         commit_date = result.stdout.strip()
-        day = commit_date.split()[0] # Get day part from "YYYY-MM-DD"
+        day = commit_date.split()[0]  # Get day part from "YYYY-MM-DD"
         return day
     else:
         return f"Error: {result.stderr.strip()}"
